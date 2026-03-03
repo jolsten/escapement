@@ -1,0 +1,41 @@
+[project]
+name = "escapement"
+dynamic = ["version"]
+description = "Composable time code encoder/decoder"
+readme = "README.md"
+authors = [
+    { name = "Jonathan Olsten", email = "jonathan.olsten@gmail.com" }
+]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/escapement/_version.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.141.1",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+target-version = "py39"
+src = ["src"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["escapement"]
