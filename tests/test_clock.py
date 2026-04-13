@@ -686,6 +686,130 @@ class TestStringEpoch:
         assert c.decode(c.encode(t)) == t
 
 
+# ── decode_ticks ────────────────────────────────────────────────────
+
+
+class TestDecodeTicks:
+    def test_unix_scalar(self):
+        c = Clock.unix()
+        assert c.decode_ticks(42) == c.epoch + np.timedelta64(42, "s")
+
+    def test_matches_decode_unix(self):
+        c = Clock.unix()
+        t = np.datetime64("2025-06-15T12:34:56", "ns")
+        ticks = int((t - c.epoch) / np.timedelta64(1, "s"))
+        assert c.decode_ticks(ticks) == c.decode(c.encode(t))
+
+    def test_matches_decode_cuc(self):
+        c = Clock.cuc(coarse_bytes=4, fine_bytes=2)
+        t = c.epoch + np.timedelta64(1_500_000_000, "ns")
+        encoded = c.encode(t)
+        coarse = int.from_bytes(bytes(encoded[:4]), "big")
+        fine = int.from_bytes(bytes(encoded[4:6]), "big")
+        assert c.decode_ticks(coarse, fine) == c.decode(encoded)
+
+    def test_matches_decode_cds(self):
+        c = Clock.cds()
+        assert c.decode_ticks(3, 12345) == c.epoch + np.timedelta64(
+            3 * 86400 * 1000 + 12345, "ms"
+        )
+
+    def test_matches_decode_gps(self):
+        c = Clock.gps()
+        assert c.decode_ticks(2, 100000) == c.epoch + np.timedelta64(
+            2 * 604800 + 100000, "s"
+        )
+
+    def test_array_input(self):
+        c = Clock.cds()
+        days = np.array([0, 1, 2], dtype=np.int64)
+        ms = np.array([0, 1000, 2000], dtype=np.int64)
+        out = c.decode_ticks(days, ms)
+        assert out.shape == (3,)
+        for i, (d, m) in enumerate(zip(days, ms)):
+            assert out[i] == c.decode_ticks(int(d), int(m))
+
+    def test_broadcast(self):
+        c = Clock.cds()
+        out = c.decode_ticks(1, np.array([0, 1000], dtype=np.int64))
+        assert out.shape == (2,)
+        assert out[0] == c.decode_ticks(1, 0)
+
+    def test_kwargs(self):
+        c = Clock(
+            epoch="UNIX",
+            fields=(
+                ClockField(1, 86400, 2, name="day"),
+                ClockField(1, 3600, 1, name="hour"),
+                ClockField(1, 60, 1, name="minute"),
+                ClockField(1, 1, 1, name="second"),
+            ),
+        )
+        out = c.decode_ticks(day=1, hour=2, minute=3, second=4)
+        assert out == c.decode_ticks(1, 2, 3, 4)
+
+    def test_kwargs_require_all_named(self):
+        c = Clock.unix()
+        with pytest.raises(TypeError, match="name"):
+            c.decode_ticks(seconds=1)
+
+    def test_mixed_positional_and_kwargs_rejected(self):
+        c = Clock(epoch="UNIX", fields=(ClockField(1, 1, 4, name="s"),))
+        with pytest.raises(TypeError, match="positional or named"):
+            c.decode_ticks(1, s=1)
+
+    def test_wrong_arity(self):
+        c = Clock.cds()  # 2 fields
+        with pytest.raises(TypeError, match="expected 2"):
+            c.decode_ticks(1)
+
+    def test_non_integer_dtype_rejected(self):
+        c = Clock.unix()
+        with pytest.raises(TypeError, match="integer"):
+            c.decode_ticks(1.5)
+
+    def test_negative_rejected(self):
+        c = Clock.unix()
+        with pytest.raises(ValueError, match="non-negative"):
+            c.decode_ticks(-1)
+
+    def test_scalar_returns_scalar(self):
+        c = Clock.unix()
+        assert np.ndim(c.decode_ticks(1)) == 0
+
+    def test_numpy_int_scalar(self):
+        c = Clock.unix()
+        assert c.decode_ticks(np.int32(7)) == c.epoch + np.timedelta64(7, "s")
+
+    def test_ticks_above_field_width_allowed(self):
+        # decode_ticks does NOT validate against width
+        c = Clock.unix(num_bytes=1)  # width=1, max byte=255
+        out = c.decode_ticks(1000)
+        assert out == c.epoch + np.timedelta64(1000, "s")
+
+
+class TestNsPerTick:
+    def test_seconds(self):
+        assert ClockField(1, 1, 4).ns_per_tick == 1_000_000_000
+
+    def test_milliseconds(self):
+        assert ClockField(1000, 1, 4).ns_per_tick == 1_000_000
+
+    def test_days(self):
+        assert ClockField(1, 86400, 2).ns_per_tick == 86_400 * 1_000_000_000
+
+    def test_sub_ns_raises(self):
+        # CUC fine 4 bytes: 2^32 ticks/s → not an integer ns
+        f = ClockField(2**32, 1, 4)
+        with pytest.raises(ValueError, match="sub-ns"):
+            _ = f.ns_per_tick
+
+    def test_cuc_fine_2_raises(self):
+        # 65536 ticks/s reduces to _tick_num=128 ≠ 1
+        with pytest.raises(ValueError, match="sub-ns"):
+            _ = ClockField(65536, 1, 2).ns_per_tick
+
+
 # ── Decode-then-encode round-trip ───────────────────────────────────
 
 

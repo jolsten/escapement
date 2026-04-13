@@ -37,6 +37,7 @@ class ClockField:
     ticks: int
     seconds: int
     width: int
+    name: str | None = None
     _tick_num: int = field(init=False, repr=False, compare=False)
     _tick_den: int = field(init=False, repr=False, compare=False)
 
@@ -50,6 +51,20 @@ class ClockField:
         g = math.gcd(self.ticks, _NS * self.seconds)
         object.__setattr__(self, "_tick_num", self.ticks // g)
         object.__setattr__(self, "_tick_den", (_NS * self.seconds) // g)
+
+    @property
+    def ns_per_tick(self) -> int:
+        """Exact nanoseconds per tick.
+
+        Raises ValueError if one tick is not an integer number of nanoseconds
+        (i.e. the reduced rate has _tick_num != 1).
+        """
+        if self._tick_num != 1:
+            raise ValueError(
+                f"tick rate {self.ticks}/{self.seconds} has sub-ns resolution; "
+                "ns_per_tick is not an exact integer"
+            )
+        return self._tick_den
 
 
 @dataclass(frozen=True, init=False)
@@ -119,6 +134,26 @@ class Clock:
             return result[0]
         return result
 
+    def _extract_ticks_from_bytes(self, arr: np.ndarray) -> tuple[np.ndarray, ...]:
+        """Read big-endian field bytes from a (n, total_bytes) array into int64 ticks."""
+        out: list[np.ndarray] = []
+        col = 0
+        for f in self.fields:
+            ticks = np.zeros(arr.shape[0], dtype=np.int64)
+            for i in range(f.width):
+                shift = (f.width - 1 - i) * 8
+                ticks |= arr[:, col + i].astype(np.int64) << shift
+            out.append(ticks)
+            col += f.width
+        return tuple(out)
+
+    def _accumulate_ns(self, ticks_per_field: tuple[np.ndarray, ...]) -> np.ndarray:
+        n = ticks_per_field[0].shape[0]
+        total_ns = np.zeros(n, dtype=np.int64)
+        for f, ticks in zip(self.fields, ticks_per_field):
+            total_ns += ticks * f._tick_den // f._tick_num
+        return total_ns
+
     def decode(self, data: bytes | np.ndarray) -> np.datetime64 | np.ndarray:
         if isinstance(data, (bytes, bytearray)):
             arr = np.frombuffer(data, dtype=np.uint8).reshape(1, -1)
@@ -134,16 +169,87 @@ class Clock:
             raise ValueError(
                 f"expected {self.total_bytes} bytes per row, got {arr.shape[1]}"
             )
-        n = arr.shape[0]
-        total_ns = np.zeros(n, dtype=np.int64)
-        col = 0
-        for f in self.fields:
-            ticks = np.zeros(n, dtype=np.int64)
-            for i in range(f.width):
-                shift = (f.width - 1 - i) * 8
-                ticks |= arr[:, col + i].astype(np.int64) << shift
-            total_ns += ticks * f._tick_den // f._tick_num
-            col += f.width
+        ticks_per_field = self._extract_ticks_from_bytes(arr)
+        total_ns = self._accumulate_ns(ticks_per_field)
+        result = self.epoch + total_ns.astype("timedelta64[ns]")
+        if scalar:
+            return result[0]
+        return result
+
+    def decode_ticks(
+        self,
+        *positional: int | np.ndarray,
+        **named: int | np.ndarray,
+    ) -> np.datetime64 | np.ndarray:
+        """Decode pre-extracted per-field tick counts to datetime64[ns].
+
+        Accepts one value per field, in field order, OR by name (mutually
+        exclusive). Each value is a Python int / numpy integer scalar, or a
+        1-D ndarray of integers. Array inputs must broadcast to a common
+        shape. Returns a scalar datetime64 if all inputs are scalar,
+        otherwise a 1-D array.
+        """
+        if positional and named:
+            raise TypeError(
+                "decode_ticks: pass either positional or named values, not both"
+            )
+        if named:
+            field_names = [f.name for f in self.fields]
+            if any(n is None for n in field_names):
+                raise TypeError(
+                    "decode_ticks: kwargs require every field to have a name"
+                )
+            if len(set(field_names)) != len(field_names):
+                raise TypeError("decode_ticks: kwargs require unique field names")
+            missing = [n for n in field_names if n not in named]
+            extra = [n for n in named if n not in field_names]
+            if missing or extra:
+                raise TypeError(
+                    f"decode_ticks: missing fields {missing}, unknown kwargs {extra}"
+                )
+            values: list[int | np.ndarray] = [named[n] for n in field_names]
+        else:
+            if len(positional) != len(self.fields):
+                raise TypeError(
+                    f"decode_ticks: expected {len(self.fields)} values, "
+                    f"got {len(positional)}"
+                )
+            values = list(positional)
+
+        scalar = True
+        arrays: list[np.ndarray] = []
+        for v in values:
+            a = np.asarray(v)
+            if not np.issubdtype(a.dtype, np.integer):
+                raise TypeError(
+                    f"decode_ticks: values must be integer dtype, got {a.dtype}"
+                )
+            if a.ndim > 1:
+                raise ValueError("decode_ticks: array values must be 1-D")
+            if a.ndim == 1:
+                scalar = False
+            if np.any(a < 0):
+                raise ValueError("decode_ticks: values must be non-negative")
+            arrays.append(a.astype(np.int64))
+
+        bcast_shape = np.broadcast_shapes(*(a.shape for a in arrays))
+        if bcast_shape == ():
+            arrays = [np.atleast_1d(a) for a in arrays]
+        else:
+            arrays = [np.broadcast_to(a, bcast_shape).astype(np.int64) for a in arrays]
+
+        # Per-field overflow guard: ticks * _tick_den must fit in int64.
+        int64_max = (1 << 63) - 1
+        for f, ticks in zip(self.fields, arrays):
+            if ticks.size:
+                max_tick = int(ticks.max())
+                if max_tick * f._tick_den > int64_max:
+                    raise OverflowError(
+                        f"decode_ticks: tick value {max_tick} * rate {f._tick_den} "
+                        "exceeds int64"
+                    )
+
+        total_ns = self._accumulate_ns(tuple(arrays))
         result = self.epoch + total_ns.astype("timedelta64[ns]")
         if scalar:
             return result[0]
